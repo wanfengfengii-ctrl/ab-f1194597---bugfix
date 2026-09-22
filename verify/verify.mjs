@@ -37,7 +37,7 @@ async function group(name, fn) {
   }
 }
 
-async function api(method, path, { body, admin, raw, contentType } = {}) {
+async function api(method, path, { body, admin, raw, contentType, signal } = {}) {
   const headers = {};
   if (body !== undefined || raw !== undefined) headers['content-type'] = contentType || 'application/json';
   if (admin) headers['x-admin-token'] = ADMIN;
@@ -45,6 +45,7 @@ async function api(method, path, { body, admin, raw, contentType } = {}) {
     method,
     headers,
     body: raw ?? (body !== undefined ? JSON.stringify(body) : undefined),
+    signal,
   });
   let json = null;
   try { json = await res.json(); } catch { /* non-json */ }
@@ -82,6 +83,20 @@ function chain(signer, deviceId, n, { keyVersion = 1, startSeq = 1, prev = '0'.r
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const rid = (() => { let n = 0; const p = 'v-' + Math.random().toString(36).slice(2, 8) + '-'; return () => p + (n++); })();
+
+/** Independently verify a checkpoint's Ed25519 signature under the shared key. */
+function checkpointSigOk(cp) {
+  const seedEnv = process.env.CHECKPOINT_SIGNING_KEY;
+  if (!seedEnv) return false;
+  const { bytes } = canonicalCheckpoint(cp);
+  const priv = createPrivateKey({
+    key: Buffer.concat([ED25519_PKCS8_PREFIX, Buffer.from(seedEnv, 'base64url')]),
+    format: 'der', type: 'pkcs8',
+  });
+  const pubRaw = publicKeyToRaw(createPublicKey(priv));
+  return encodeB64Url(pubRaw) === cp.signerPublicKey
+    && verifyBytes(createPublicKey(priv), bytes, decodeB64Url(cp.signature));
+}
 
 async function main() {
   console.log(`Acceptance target: ${BASE}`);
@@ -472,23 +487,133 @@ async function main() {
 
     // Independently verify the checkpoint: canonical bytes, signature and digest.
     const cp = compact.json.checkpoint;
-    const { bytes: cpBytes } = canonicalCheckpoint(cp);
-    const seedEnv = process.env.CHECKPOINT_SIGNING_KEY;
-    let cpOk = false;
-    if (seedEnv) {
-      const priv = createPrivateKey({ key: Buffer.concat([ED25519_PKCS8_PREFIX, Buffer.from(seedEnv, 'base64url')]), format: 'der', type: 'pkcs8' });
-      const pubRaw = publicKeyToRaw(createPublicKey(priv));
-      cpOk = encodeB64Url(pubRaw) === cp.signerPublicKey
-        ? verifyBytes(createPublicKey(priv), cpBytes, decodeB64Url(cp.signature))
-        : false;
-    }
-    check('checkpoint signature verifies under shared key', cpOk);
+    check('checkpoint signature verifies under shared key', checkpointSigOk(cp));
     check('checkpoint digest equals cutoff event digest', cp.digest === c8[5].digest);
 
     const gone = await api('GET', `/v1/devices/${d8}/events`);
     check('reading behind checkpoint returns 410 with recovery point', gone.status === 410 && gone.json.error.details.resumeFromSequence === 7);
     const resumed = await api('GET', `/v1/devices/${d8}/events?afterSequence=6`);
     check('resumed read returns exactly the retained tail', resumed.status === 200 && resumed.json.events.map((e) => e.sequence).join() === '7,8,9,10,11,12');
+  });
+
+  await group('long-poll checkpoint recovery (410) and resumable tail', async () => {
+    // The reported defect: sequences 1..4 compacted to cutoff 2 (below the
+    // background threshold of 5), then GET /wait?afterSequence=0 returned
+    // HTTP 200 with only events 3,4 - a superficially successful but
+    // discontinuous stream. It must now be 410 with the verifiable sequence-2
+    // checkpoint and resumeFromSequence=3; waiting at afterSequence=2 must then
+    // deliver exactly 3,4.
+    const d = 'acc-waitcp-' + Math.random().toString(36).slice(2, 8);
+    const s = new Signer();
+    await api('POST', '/v1/devices', { body: { deviceId: d, publicKey: s.publicB64Url } });
+    const c = chain(s, d, 4);
+    await api('POST', `/v1/devices/${d}/ingest`, { body: { requestId: rid(), events: c.map((x) => x.event) } });
+
+    // Normal continuous waiting is unchanged: before any checkpoint the full
+    // consecutive prefix is delivered with 200.
+    const normal = await api('GET', `/v1/devices/${d}/wait?afterSequence=0`);
+    check('pre-compaction wait returns the full consecutive prefix',
+      normal.status === 200 && normal.json.timeout === false &&
+      normal.json.events.map((e) => e.sequence).join() === '1,2,3,4');
+
+    const compact = await api('POST', '/v1/admin/compact', {
+      admin: true,
+      body: { deviceId: d, commandId: 'wcp-' + rid(), cutoffSequence: 2 },
+    });
+    check('manual checkpoint covers sequence 2',
+      compact.status === 200 && compact.json.checkpoint.sequence === 2);
+    const cp = compact.json.checkpoint;
+    check('wait-recovery checkpoint signature verifies', checkpointSigOk(cp));
+    check('wait-recovery checkpoint digest matches event 2', cp.digest === c[1].digest);
+
+    const gone = await api('GET', `/v1/devices/${d}/wait?afterSequence=0`);
+    check('wait behind checkpoint is 410 with checkpoint + resumeFromSequence=3',
+      gone.status === 410 &&
+      gone.json.error.code === 'GONE' &&
+      gone.json.error.details.resumeFromSequence === 3 &&
+      gone.json.error.details.checkpoint.sequence === 2 &&
+      checkpointSigOk(gone.json.error.details.checkpoint),
+      `status=${gone.status}`);
+    // It must never be the gapped 200 tail.
+    check('wait 410 body carries no gapped event tail',
+      gone.status === 410 && gone.json.error.details.events === undefined);
+
+    // Caller verifies the checkpoint and continues anchored at its sequence.
+    const resumed = await api('GET', `/v1/devices/${d}/wait?afterSequence=2`);
+    check('resumed wait after checkpoint returns exactly events 3,4',
+      resumed.status === 200 && resumed.json.timeout === false &&
+      resumed.json.events.map((e) => e.sequence).join() === '3,4');
+
+    // Paginated read at the same position is consistent with the resumed wait.
+    const page = await api('GET', `/v1/devices/${d}/events?afterSequence=2&limit=10`);
+    check('resumed wait and paginated read agree on the retained tail',
+      page.status === 200 && page.json.events.map((e) => e.sequence).join() ===
+      resumed.json.events.map((e) => e.sequence).join());
+
+    // Waiting not-behind the checkpoint behaves normally: a waiter anchored at
+    // the current hwm wakes on a subsequent commit and receives only the new
+    // event (the checkpoint does not disturb legal continuous waiting).
+    const ext = chain(s, d, 1, { startSeq: 5, prev: c[3].digest });
+    const nextWaitP = api('GET', `/v1/devices/${d}/wait?afterSequence=4`);
+    await sleep(300); // LISTEN established and blocked
+    await api('POST', `/v1/devices/${d}/ingest`, { body: { requestId: rid(), events: ext.map((x) => x.event) } });
+    const caughtUp = await nextWaitP;
+    check('wait at/after the checkpoint wakes normally on a new commit',
+      caughtUp.status === 200 && caughtUp.json.timeout === false &&
+      caughtUp.json.events.map((e) => e.sequence).join() === '5');
+  });
+
+  await group('long-poll during concurrent compaction never jumps the checkpoint with 200', async () => {
+    // A waiter blocks at hwm with afterSequence=0; events commit (waking it) and
+    // history is immediately compacted to cutoff 2. Whatever the commit
+    // interleaving, the wait must end in either a complete consecutive 200
+    // batch (1..4) or the 410 recovery - never only 3,4.
+    const d = 'acc-waitrace-' + Math.random().toString(36).slice(2, 8);
+    const s = new Signer();
+    await api('POST', '/v1/devices', { body: { deviceId: d, publicKey: s.publicB64Url } });
+
+    const pending = api('GET', `/v1/devices/${d}/wait?afterSequence=0`);
+    await sleep(300); // LISTEN established, waiter blocked on hwm == 0
+    const c = chain(s, d, 4);
+    await api('POST', `/v1/devices/${d}/ingest`, { body: { requestId: rid(), events: c.map((x) => x.event) } });
+    const compact = await api('POST', '/v1/admin/compact', {
+      admin: true,
+      body: { deviceId: d, commandId: 'wrace-' + rid(), cutoffSequence: 2 },
+    });
+    check('racing compaction committed a checkpoint',
+      compact.status === 200 &&
+      (compact.json.checkpoint?.sequence === 2 || compact.json.replayed === true));
+    const r = await pending;
+    const seqs = r.status === 200 ? r.json.events.map((e) => e.sequence).join() : null;
+    check('racing wait is a complete 1..4 batch or a 410, never a gapped tail',
+      (r.status === 200 && seqs === '1,2,3,4') ||
+      (r.status === 410 && r.json.error.details.resumeFromSequence === 3),
+      `status=${r.status} seqs=${seqs}`);
+
+    // A waiter caught up AT the high watermark (afterSequence=4) that is
+    // NOT behind a cutoff-2 checkpoint must not be disturbed by the checkpoint
+    // notification: it re-checks on the wake and stays blocked, returning
+    // neither a spurious 410 nor any events. (The request is aborted after the
+    // assertion so the acceptance run does not wait out WAIT_TIMEOUT.)
+    const d2 = 'acc-waitwake-' + Math.random().toString(36).slice(2, 8);
+    const s2 = new Signer();
+    await api('POST', '/v1/devices', { body: { deviceId: d2, publicKey: s2.publicB64Url } });
+    const c2 = chain(s2, d2, 4);
+    await api('POST', `/v1/devices/${d2}/ingest`, { body: { requestId: rid(), events: c2.map((x) => x.event) } });
+    const ac2 = new AbortController();
+    let caughtUp = null;
+    const blockedP = api('GET', `/v1/devices/${d2}/wait?afterSequence=4`, { signal: ac2.signal })
+      .then((v) => { caughtUp = v; }, () => {});
+    await sleep(300); // LISTEN established and blocked
+    await api('POST', '/v1/admin/compact', {
+      admin: true,
+      body: { deviceId: d2, commandId: 'wwake-' + rid(), cutoffSequence: 2 },
+    });
+    await Promise.race([blockedP, sleep(1500)]);
+    check('checkpoint behind a caught-up waiter neither 410s nor delivers events',
+      caughtUp === null, caughtUp ? `unexpected status=${caughtUp.status}` : '');
+    ac2.abort();
+    await blockedP.catch(() => {});
   });
 
   await group('background worker compaction', async () => {

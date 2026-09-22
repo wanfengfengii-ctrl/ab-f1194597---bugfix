@@ -9,6 +9,7 @@ import assert from 'node:assert/strict';
 import { setupHarness, stopTestPostgres, truncateAll } from './helpers/harness.mjs';
 import { createServer } from '../src/http/server.mjs';
 import { registerDevice } from '../src/services/devices.mjs';
+import { compactDevice } from '../src/services/compaction.mjs';
 import { DeviceSigner, buildChain } from './helpers/events.mjs';
 
 let h, server1, server2, base1, base2;
@@ -165,4 +166,30 @@ test('wait long-polls and returns new events', async () => {
   assert.equal(r.status, 200);
   assert.equal(r.json.timeout, false);
   assert.equal(r.json.events.length, 1);
+});
+
+test('wait behind a checkpoint is 410 with recovery; resuming returns the tail', async () => {
+  // HTTP-level regression for the reported defect: compacted history must not
+  // be crossed with a gapped 200 by the long-poll endpoint.
+  const id = 'dev-http-wait-410';
+  const signer = new DeviceSigner();
+  await registerDevice(h.pool, { deviceId: id, publicKeyRaw: signer.publicRaw });
+  const chain = buildChain(signer, id, 4);
+  await call(base1, 'POST', `/v1/devices/${id}/ingest`, {
+    body: { requestId: 'w410', events: chain },
+  });
+  await compactDevice(h.pool, h.serverKey, h.cfg, id, 2, 'cmd-http-wait-410');
+
+  const gone = await call(base1, 'GET', `/v1/devices/${id}/wait?afterSequence=0`);
+  assert.equal(gone.status, 410);
+  assert.equal(gone.json.error.code, 'GONE');
+  assert.equal(gone.json.error.details.resumeFromSequence, 3);
+  assert.equal(gone.json.error.details.checkpoint.sequence, 2);
+  assert.equal(gone.json.error.details.checkpoint.deviceId, id);
+  assert.equal(typeof gone.json.error.details.checkpoint.signature, 'string');
+
+  const resumed = await call(base2, 'GET', `/v1/devices/${id}/wait?afterSequence=2`);
+  assert.equal(resumed.status, 200);
+  assert.equal(resumed.json.timeout, false);
+  assert.deepEqual(resumed.json.events.map((e) => e.sequence), [3, 4]);
 });

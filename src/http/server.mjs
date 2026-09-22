@@ -151,7 +151,7 @@ async function handle(req, res, deps) {
     const onClose = () => ac.abort();
     res.on('close', onClose);
     try {
-      const data = await waitForEvents(pool, cfg, { deviceId, afterSequence, limit, signal: ac.signal });
+      const data = await waitForEvents(pool, serverKey, cfg, { deviceId, afterSequence, limit, signal: ac.signal });
       return { statusCode: 200, data };
     } finally {
       res.off('close', onClose);

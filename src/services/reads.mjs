@@ -8,10 +8,20 @@
 // device, position): tampering, cross-device use and parameter contradictions
 // are all rejected.
 //
-// Waiting: /wait uses LISTEN/NOTIFY. The order is LISTEN -> read watermark
-// -> block, so a notification produced between the check and the wait cannot
-// be lost. On timeout an empty page is returned. Client disconnect releases
-// the dedicated connection back to the pool immediately.
+// Waiting: /wait uses LISTEN/NOTIFY. The order is LISTEN -> read state ->
+// block, so a notification produced between the check and the wait cannot be
+// lost. Both try_advance (ingest) and the checkpoints INSERT trigger fire on
+// the same channel, so a compaction that lands while a waiter is blocked wakes
+// it immediately. On timeout an empty page is returned. Client disconnect
+// releases the dedicated connection back to the pool immediately.
+//
+// Recovery semantics: like the paginated read, /wait must never return a gapped
+// tail after history compaction. Whenever afterSequence is behind the latest
+// checkpoint it returns HTTP 410 GONE carrying the verifiable checkpoint and
+// resumeFromSequence. The check runs before every read, after every wakeup
+// (including timeout), and again right after fetching events, so a compaction
+// committing concurrently with the request can never cross the checkpoint with
+// an HTTP 200.
 
 import { randomUUID } from 'node:crypto';
 import { withTransaction } from '../db/pool.mjs';
@@ -178,10 +188,34 @@ export async function readPage(pool, serverKey, cfg, params) {
 }
 
 /**
+ * Read the device watermark and the latest checkpoint sequence in one query.
+ * Rows committed by a concurrent transaction only ever become visible together,
+ * so the two values are mutually consistent at each read.
+ */
+async function readWaitState(client, deviceId) {
+  const { rows } = await client.query(
+    `SELECT d.high_watermark AS hwm,
+            (SELECT c.sequence FROM checkpoints c
+              WHERE c.device_id = d.device_id
+              ORDER BY c.sequence DESC LIMIT 1) AS checkpoint_seq
+       FROM devices d WHERE d.device_id=$1`,
+    [deviceId]
+  );
+  if (rows.length === 0) return null;
+  return { hwm: Number(rows[0].hwm), checkpointSeq: rows[0].checkpoint_seq ? Number(rows[0].checkpoint_seq) : 0 };
+}
+
+/**
  * Long-poll for new consecutive events.
+ *
+ * Recovery mirrors {@link readPage}: if afterSequence is at or behind a
+ * checkpoint the compacted events can no longer be delivered, so the call
+ * rejects with HTTP 410 GONE carrying the checkpoint and resumeFromSequence
+ * instead of returning a discontinuous tail.
+ *
  * @param signal AbortSignal from the HTTP request (client disconnect)
  */
-export async function waitForEvents(pool, cfg, { deviceId, afterSequence, limit, signal }) {
+export async function waitForEvents(pool, serverKey, cfg, { deviceId, afterSequence, limit, signal }) {
   if (!Number.isInteger(afterSequence) || afterSequence < 0) {
     throw errors.validation('afterSequence must be a non-negative integer');
   }
@@ -207,14 +241,70 @@ export async function waitForEvents(pool, cfg, { deviceId, afterSequence, limit,
       return rows.map(eventRow);
     };
 
-    // LISTEN happened BEFORE this check: any committing advancement either was
-    // already visible here, or its NOTIFY is queued for the wait below.
-    const dev = await client.query('SELECT high_watermark FROM devices WHERE device_id=$1', [deviceId]);
-    if (dev.rows.length === 0) throw errors.deviceNotFound(deviceId);
-    let hwm = Number(dev.rows[0].high_watermark);
+    // 410 with the same recovery payload a paginated read would return, so a
+    // caller has one recovery path for both read styles.
+    const checkpointGone = async (checkpointSeq) => {
+      const cp = await getCheckpointPayload(pool, serverKey, deviceId, checkpointSeq);
+      throw errors.gone(
+        `events through sequence ${checkpointSeq} have been compacted into a checkpoint; ` +
+          'verify the checkpoint signature and resume from checkpoint.sequence + 1',
+        { checkpoint: cp, resumeFromSequence: checkpointSeq + 1 }
+      );
+    };
 
-    let events = hwm > afterSequence ? await readBatch(afterSequence) : [];
-    if (events.length === 0) {
+    let timedOut = false;
+    let hwm = 0;
+    // One deadline for the whole request: a wakeup that does not yield events
+    // (a notification unrelated to advancement, or a checkpoint that does not
+    // move this caller behind it) never extends the advertised wait window.
+    const deadline = Date.now() + maxWait;
+
+    // Re-evaluated from scratch after every wakeup: a compaction that commits
+    // during the wait may have deleted the events this call is waiting behind,
+    // and new ingests may make events available. LISTEN happened BEFORE the
+    // first read, so any committing advancement either was already visible here
+    // or has its NOTIFY queued for the blocking wait below (no lost wakeup).
+    for (;;) {
+      const state = await readWaitState(client, deviceId);
+      if (state === null) throw errors.deviceNotFound(deviceId);
+      hwm = state.hwm;
+
+      if (afterSequence < state.checkpointSeq) {
+        await checkpointGone(state.checkpointSeq);
+      }
+
+      if (hwm > afterSequence) {
+        const events = await readBatch(afterSequence);
+        // Guard against a compaction that committed between the state read and
+        // the event read: the checkpoint table and the covered event rows change
+        // in one transaction, so either those rows were still visible here, or
+        // the checkpoint row now exists and this re-read must observe it.
+        const { rows: cpRows } = await client.query(
+          'SELECT sequence FROM checkpoints WHERE device_id=$1 AND sequence > $2 ORDER BY sequence DESC LIMIT 1',
+          [deviceId, afterSequence]
+        );
+        if (cpRows.length) {
+          await checkpointGone(Number(cpRows[0].sequence));
+        }
+        return {
+          deviceId,
+          highWatermark: hwm,
+          afterSequence,
+          timeout: false,
+          events,
+        };
+      }
+
+      if (timedOut) {
+        return {
+          deviceId,
+          highWatermark: hwm,
+          afterSequence,
+          timeout: true,
+          events: [],
+        };
+      }
+
       await new Promise((resolve) => {
         let settled = false;
         let timer = null;
@@ -234,7 +324,7 @@ export async function waitForEvents(pool, cfg, { deviceId, afterSequence, limit,
         // is idle, so NOTIFY arrives immediately with no polling query.
         client.on('notification', onNotification);
         signal?.addEventListener('abort', onAbort, { once: true });
-        timer = setTimeout(finish, maxWait);
+        timer = setTimeout(() => { timedOut = true; finish(); }, Math.max(0, deadline - Date.now()));
       });
 
       if (signal?.aborted) {
@@ -242,18 +332,7 @@ export async function waitForEvents(pool, cfg, { deviceId, afterSequence, limit,
         e.code = 'ABORTED';
         throw e;
       }
-      const again = await client.query('SELECT high_watermark FROM devices WHERE device_id=$1', [deviceId]);
-      hwm = Number(again.rows[0].high_watermark);
-      events = hwm > afterSequence ? await readBatch(afterSequence) : [];
     }
-
-    return {
-      deviceId,
-      highWatermark: hwm,
-      afterSequence,
-      timeout: events.length === 0,
-      events,
-    };
   } finally {
     try {
       await client.query('UNLISTEN telemetry_events');
