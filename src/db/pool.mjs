@@ -29,14 +29,13 @@ function logTs() {
 }
 
 /**
- * Run fn with a dedicated client, committing on success and rolling back on
- * throw. BEGIN/COMMIT through the simple query protocol.
+ * Run fn inside a transaction on an ALREADY-CHECKED-OUT client. Used by callers
+ * that must keep session state (e.g. LISTEN registrations) across the
+ * transaction: borrowing a separate client would lose that state.
  */
-export async function withTransaction(pool, fn, options = {}) {
-  const client = await pool.connect();
+export async function withClientTransaction(client, fn) {
+  await client.query('BEGIN');
   try {
-    await client.query('BEGIN');
-    if (options.serializable) await client.query('SET TRANSACTION ISOLATION LEVEL SERIALIZABLE');
     const result = await fn(client);
     await client.query('COMMIT');
     return result;
@@ -47,6 +46,23 @@ export async function withTransaction(pool, fn, options = {}) {
       // already rolled back / client gone
     }
     throw e;
+  }
+}
+
+/**
+ * Run fn with a dedicated client, committing on success and rolling back on
+ * throw. BEGIN/COMMIT through the simple query protocol.
+ */
+export async function withTransaction(pool, fn, options = {}) {
+  const client = await pool.connect();
+  try {
+    if (options.serializable) {
+      return await withClientTransaction(client, async (c) => {
+        await c.query('SET TRANSACTION ISOLATION LEVEL SERIALIZABLE');
+        return fn(c);
+      });
+    }
+    return await withClientTransaction(client, fn);
   } finally {
     client.release();
   }

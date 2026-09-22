@@ -5,6 +5,7 @@
 // instance-agnostic behavior.
 
 import { test, before, after, beforeEach } from 'node:test';
+import { randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { setupHarness, stopTestPostgres, truncateAll } from './helpers/harness.mjs';
 import { createServer } from '../src/http/server.mjs';
@@ -165,4 +166,63 @@ test('wait long-polls and returns new events', async () => {
   assert.equal(r.status, 200);
   assert.equal(r.json.timeout, false);
   assert.equal(r.json.events.length, 1);
+});
+
+test('wait behind a checkpoint is 410 with recovery point; resume then matches paginated read', async () => {
+  const id = 'dev-http-wait-410';
+  const signer = new DeviceSigner();
+  await call(base1, 'POST', '/v1/devices', { body: { deviceId: id, publicKey: signer.publicB64Url } });
+  await call(base1, 'POST', `/v1/devices/${id}/ingest`, {
+    body: { requestId: randomUUID(), events: buildChain(signer, id, 4) },
+  });
+  const compact = await call(base2, 'POST', '/v1/admin/compact', {
+    admin: true,
+    body: { deviceId: id, commandId: randomUUID(), cutoffSequence: 2 },
+  });
+  assert.equal(compact.json.checkpoint.sequence, 2);
+
+  const gone = await call(base1, 'GET', `/v1/devices/${id}/wait?afterSequence=0`);
+  assert.equal(gone.status, 410);
+  assert.equal(gone.json.error.code, 'GONE');
+  assert.equal(gone.json.error.details.resumeFromSequence, 3);
+  assert.equal(gone.json.error.details.checkpoint.sequence, 2);
+  assert.ok(typeof gone.json.error.details.checkpoint.signature === 'string');
+  assert.ok(typeof gone.json.error.details.checkpoint.signerPublicKey === 'string');
+
+  // Caller verifies, anchors at the checkpoint and long-polls the retained tail.
+  const resumed = await call(base2, 'GET', `/v1/devices/${id}/wait?afterSequence=2`);
+  assert.equal(resumed.status, 200);
+  assert.deepEqual(resumed.json.events.map((e) => e.sequence), [3, 4]);
+
+  // /wait recovery must be consistent with paginated /events.
+  const pageGone = await call(base1, 'GET', `/v1/devices/${id}/events?afterSequence=0`);
+  assert.equal(pageGone.status, 410);
+  assert.equal(pageGone.json.error.details.resumeFromSequence, 3);
+  const page = await call(base1, 'GET', `/v1/devices/${id}/events?afterSequence=2`);
+  assert.deepEqual(page.json.events.map((e) => e.sequence), [3, 4]);
+});
+
+test('wait parked across an ingest-then-compact never returns a tail-only 200', async () => {
+  const id = 'dev-http-wait-parked';
+  const signer = new DeviceSigner();
+  await call(base1, 'POST', '/v1/devices', { body: { deviceId: id, publicKey: signer.publicB64Url } });
+
+  const p = call(base1, 'GET', `/v1/devices/${id}/wait?afterSequence=0`);
+  setTimeout(async () => {
+    await call(base2, 'POST', `/v1/devices/${id}/ingest`, {
+      body: { requestId: randomUUID(), events: buildChain(signer, id, 4) },
+    });
+    await call(base2, 'POST', '/v1/admin/compact', {
+      admin: true,
+      body: { deviceId: id, commandId: randomUUID(), cutoffSequence: 2 },
+    });
+  }, 200);
+  const r = await p;
+  if (r.status === 410) {
+    assert.equal(r.json.error.details.resumeFromSequence, 3);
+    assert.equal(r.json.error.details.checkpoint.sequence, 2);
+  } else {
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.json.events.map((e) => e.sequence), [1, 2, 3, 4]);
+  }
 });

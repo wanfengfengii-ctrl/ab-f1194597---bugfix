@@ -489,6 +489,99 @@ async function main() {
     check('reading behind checkpoint returns 410 with recovery point', gone.status === 410 && gone.json.error.details.resumeFromSequence === 7);
     const resumed = await api('GET', `/v1/devices/${d8}/events?afterSequence=6`);
     check('resumed read returns exactly the retained tail', resumed.status === 200 && resumed.json.events.map((e) => e.sequence).join() === '7,8,9,10,11,12');
+
+    // Long polling must use the SAME recovery semantics as the paginated read:
+    // a wait positioned before the checkpoint is 410 (never a 200 that skips
+    // the deleted prefix), and resuming at the checkpoint returns the tail.
+    const waitGone = await api('GET', `/v1/devices/${d8}/wait?afterSequence=0`);
+    check('wait behind checkpoint is 410 with checkpoint and resumeFromSequence',
+      waitGone.status === 410
+        && waitGone.json.error.code === 'GONE'
+        && waitGone.json.error.details.resumeFromSequence === 7
+        && waitGone.json.error.details.checkpoint.sequence === 6);
+    if (waitGone.status === 410) {
+      const wcp = waitGone.json.error.details.checkpoint;
+      const { bytes: wcpBytes } = canonicalCheckpoint(wcp);
+      let ok = false;
+      if (process.env.CHECKPOINT_SIGNING_KEY) {
+        const priv = createPrivateKey({ key: Buffer.concat([ED25519_PKCS8_PREFIX, Buffer.from(process.env.CHECKPOINT_SIGNING_KEY, 'base64url')]), format: 'der', type: 'pkcs8' });
+        ok = verifyBytes(createPublicKey(priv), wcpBytes, decodeB64Url(wcp.signature))
+          && wcp.digest === c8[5].digest;
+      }
+      check('410 wait checkpoint signature and digest verify', ok);
+    }
+    const waitResumed = await api('GET', `/v1/devices/${d8}/wait?afterSequence=6`);
+    check('resumed wait returns exactly the retained tail',
+      waitResumed.status === 200 && waitResumed.json.events.map((e) => e.sequence).join() === '7,8,9,10,11,12');
+    const waitAtOrAfter = await api('GET', `/v1/devices/${d8}/wait?afterSequence=7`);
+    check('wait at/after the checkpoint is not GONE',
+      waitAtOrAfter.status === 200 && waitAtOrAfter.json.events.map((e) => e.sequence).join() === '8,9,10,11,12');
+  });
+
+  await group('long-poll 410 recovery across compaction', async () => {
+    // The reported defect, end to end through the proxy: 4 events, manual
+    // checkpoint at 2, then /wait?afterSequence=0 must not return a tail-only
+    // 200. Also covers the normal consecutive wait BEFORE compaction and a
+    // compaction landing WHILE a wait is parked.
+    const dw = 'acc-w410-' + Math.random().toString(36).slice(2, 8);
+    const sw = new Signer();
+    await api('POST', '/v1/devices', { body: { deviceId: dw, publicKey: sw.publicB64Url } });
+    const cw = chain(sw, dw, 4);
+    await api('POST', `/v1/devices/${dw}/ingest`, { body: { requestId: rid(), events: cw.map((x) => x.event) } });
+
+    // Pre-compaction: a normal consecutive wait from the start returns the
+    // complete prefix immediately.
+    const before = await api('GET', `/v1/devices/${dw}/wait?afterSequence=0`);
+    check('consecutive wait before compaction returns the full prefix',
+      before.status === 200 && before.json.events.map((e) => e.sequence).join() === '1,2,3,4');
+
+    // Park a waiter on a SECOND empty device, then fill and compact it while
+    // the wait is in flight. The answer is either a 410 recovery point or a
+    // 200 containing the complete prefix 1..4 - a 200 with only the retained
+    // tail (3,4) is the bug and must never happen.
+    const dp = 'acc-wpark-' + Math.random().toString(36).slice(2, 8);
+    const sp = new Signer();
+    await api('POST', '/v1/devices', { body: { deviceId: dp, publicKey: sp.publicB64Url } });
+    const parked = api('GET', `/v1/devices/${dp}/wait?afterSequence=0`);
+    await sleep(300);
+    const cpEvents = chain(sp, dp, 4);
+    await api('POST', `/v1/devices/${dp}/ingest`, { body: { requestId: rid(), events: cpEvents.map((x) => x.event) } });
+    await api('POST', '/v1/admin/compact', {
+      admin: true,
+      body: { deviceId: dp, commandId: rid(), cutoffSequence: 2 },
+    });
+    const pr = await parked;
+    if (pr.status === 410) {
+      check('parked wait compacted mid-flight gets 410 recovery point',
+        pr.json.error.details.resumeFromSequence === 3 && pr.json.error.details.checkpoint.sequence === 2);
+      const prResumed = await api('GET', `/v1/devices/${dp}/wait?afterSequence=2`);
+      check('parked-wait recovery returns the retained tail',
+        prResumed.status === 200 && prResumed.json.events.map((e) => e.sequence).join() === '3,4');
+    } else {
+      check('parked wait that read before the checkpoint got the full prefix',
+        pr.status === 200 && pr.json.events.map((e) => e.sequence).join() === '1,2,3,4');
+    }
+    const prPageGone = await api('GET', `/v1/devices/${dp}/events?afterSequence=0`);
+    check('paginated read on the parked device agrees: 410 behind checkpoint',
+      prPageGone.status === 410 && prPageGone.json.error.details.resumeFromSequence === 3);
+
+    // The headline scenario on the first device.
+    const compact = await api('POST', '/v1/admin/compact', {
+      admin: true,
+      body: { deviceId: dw, commandId: rid(), cutoffSequence: 2 },
+    });
+    check('checkpoint at 2', compact.status === 200 && compact.json.checkpoint.sequence === 2);
+    const gone = await api('GET', `/v1/devices/${dw}/wait?afterSequence=0`);
+    check('wait?afterSequence=0 after compaction is 410, not a tail-only 200',
+      gone.status === 410 && gone.json.error.details.resumeFromSequence === 3
+        && gone.json.error.details.checkpoint.sequence === 2);
+    const tail = await api('GET', `/v1/devices/${dw}/wait?afterSequence=2`);
+    check('resumed wait after verifying checkpoint yields 3,4',
+      tail.status === 200 && tail.json.events.map((e) => e.sequence).join() === '3,4');
+    const page = await api('GET', `/v1/devices/${dw}/events?afterSequence=2`);
+    check('resumed wait and paginated read agree',
+      page.status === 200 && page.json.events.map((e) => e.sequence).join()
+        === tail.json.events.map((e) => e.sequence).join());
   });
 
   await group('background worker compaction', async () => {

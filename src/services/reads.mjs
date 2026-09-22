@@ -8,13 +8,20 @@
 // device, position): tampering, cross-device use and parameter contradictions
 // are all rejected.
 //
-// Waiting: /wait uses LISTEN/NOTIFY. The order is LISTEN -> read watermark
-// -> block, so a notification produced between the check and the wait cannot
-// be lost. On timeout an empty page is returned. Client disconnect releases
-// the dedicated connection back to the pool immediately.
+// Waiting: /wait uses LISTEN/NOTIFY on two channels (telemetry_events for
+// commits, telemetry_compacted for checkpoint inserts). The order is
+// LISTEN -> snapshot -> block, so a notification produced between the snapshot
+// and the wait cannot be lost. Every state snapshot (latest checkpoint,
+// watermark, event batch) is taken in one transaction holding a FOR SHARE lock
+// on the device row: compaction and ingest both take FOR UPDATE, so the
+// checkpoint-and-delete can never be observed half-applied. A waiter whose
+// afterSequence is behind a checkpoint gets the same 410 recovery response as a
+// paginated read - never a 200 that silently skips the compacted prefix. On
+// timeout an empty page is returned. Client disconnect releases the dedicated
+// connection back to the pool immediately.
 
 import { randomUUID } from 'node:crypto';
-import { withTransaction } from '../db/pool.mjs';
+import { withTransaction, withClientTransaction } from '../db/pool.mjs';
 import { errors } from '../errors.mjs';
 import { signCursor } from '../crypto/checkpoint.mjs';
 import { verifyCursor } from '../crypto/checkpoint.mjs';
@@ -181,7 +188,7 @@ export async function readPage(pool, serverKey, cfg, params) {
  * Long-poll for new consecutive events.
  * @param signal AbortSignal from the HTTP request (client disconnect)
  */
-export async function waitForEvents(pool, cfg, { deviceId, afterSequence, limit, signal }) {
+export async function waitForEvents(pool, serverKey, cfg, { deviceId, afterSequence, limit, signal }) {
   if (!Number.isInteger(afterSequence) || afterSequence < 0) {
     throw errors.validation('afterSequence must be a non-negative integer');
   }
@@ -192,59 +199,119 @@ export async function waitForEvents(pool, cfg, { deviceId, afterSequence, limit,
   // path (including abort), so a disconnecting client never leaks a waiter or
   // a database connection.
   const client = await pool.connect();
-  try {
-    await client.query('LISTEN telemetry_events');
 
-    const readBatch = async (from) => {
-      const { rows } = await client.query(
+  // One consistent state snapshot: latest checkpoint, watermark and the event
+  // batch are read in one transaction holding FOR SHARE on the device row.
+  // Compaction and ingest both take FOR UPDATE on that row, so:
+  //  * a checkpoint committed before the lock is visible here and yields 410;
+  //  * a compaction starting while the lock is held blocks until we COMMIT, so
+  //    the checkpoint-insert/event-delete can never be observed half-applied;
+  //  * events returned are the whole visible tail past afterSequence at one
+  //    point in time - a 200 can never skip a sequence a checkpoint covers.
+  const snapshot = async () => withClientTransaction(client, async (tx) => {
+    const dev = await tx.query(
+      'SELECT high_watermark FROM devices WHERE device_id=$1 FOR SHARE',
+      [deviceId]
+    );
+    if (dev.rows.length === 0) throw errors.deviceNotFound(deviceId);
+    const hwm = Number(dev.rows[0].high_watermark);
+
+    const cp = await tx.query(
+      'SELECT sequence FROM checkpoints WHERE device_id=$1 ORDER BY sequence DESC LIMIT 1',
+      [deviceId]
+    );
+    const checkpointSeq = cp.rows.length ? Number(cp.rows[0].sequence) : 0;
+
+    if (afterSequence < checkpointSeq) {
+      // Requested position is behind a checkpoint: surface the same verifiable
+      // recovery point as a paginated read instead of silently skipping the
+      // compacted auditable prefix.
+      const checkpoint = await getCheckpointPayload(tx, serverKey, deviceId, checkpointSeq);
+      throw errors.gone(
+        `events through sequence ${checkpointSeq} have been compacted into a checkpoint; ` +
+          'verify the checkpoint signature and resume from checkpoint.sequence + 1',
+        { checkpoint, resumeFromSequence: checkpointSeq + 1 }
+      );
+    }
+
+    let events = [];
+    if (hwm > afterSequence) {
+      const { rows } = await tx.query(
         `SELECT device_id, sequence, digest, event_id, occurred_at, key_version,
                 prev_digest, payload, signature
            FROM event_records
           WHERE device_id=$1 AND status='visible' AND sequence > $2
           ORDER BY sequence LIMIT $3`,
-        [deviceId, from, pageSize]
+        [deviceId, afterSequence, pageSize]
       );
-      return rows.map(eventRow);
-    };
+      events = rows.map(eventRow);
+    }
+    return { hwm, events };
+  });
 
-    // LISTEN happened BEFORE this check: any committing advancement either was
-    // already visible here, or its NOTIFY is queued for the wait below.
-    const dev = await client.query('SELECT high_watermark FROM devices WHERE device_id=$1', [deviceId]);
-    if (dev.rows.length === 0) throw errors.deviceNotFound(deviceId);
-    let hwm = Number(dev.rows[0].high_watermark);
+  // The handler stays attached for the ENTIRE request (including while
+  // snapshots run), so a notification committed in any window can never be
+  // emitted with no listener and lost.
+  let pendingWake = false;
+  let wakeWaiter = null;
+  const onNotification = (msg) => {
+    if (msg.payload !== deviceId) return;
+    if (msg.channel !== 'telemetry_events' && msg.channel !== 'telemetry_compacted') return;
+    pendingWake = true;
+    if (wakeWaiter) {
+      const w = wakeWaiter;
+      wakeWaiter = null;
+      w();
+    }
+  };
 
-    let events = hwm > afterSequence ? await readBatch(afterSequence) : [];
-    if (events.length === 0) {
-      await new Promise((resolve) => {
-        let settled = false;
-        let timer = null;
-        const finish = () => {
-          if (settled) return;
-          settled = true;
-          if (timer) clearTimeout(timer);
-          signal?.removeEventListener('abort', onAbort);
-          client.removeListener('notification', onNotification);
-          resolve();
-        };
-        const onNotification = (msg) => {
-          if (msg.channel === 'telemetry_events' && msg.payload === deviceId) finish();
-        };
-        const onAbort = () => finish();
-        // node-postgres keeps parsing the socket stream while the connection
-        // is idle, so NOTIFY arrives immediately with no polling query.
-        client.on('notification', onNotification);
-        signal?.addEventListener('abort', onAbort, { once: true });
-        timer = setTimeout(finish, maxWait);
-      });
+  try {
+    // Listen on BOTH channels before the first snapshot:
+    //  * telemetry_events    - additive watermark advancement (ingest etc.)
+    //  * telemetry_compacted - a checkpoint was inserted (prefix may be gone)
+    // A commit landing after this point is either already visible in a
+    // snapshot or queues a notification; NOTIFY is delivered only at COMMIT,
+    // so an aborted compaction never causes a spurious wake.
+    await client.query('LISTEN telemetry_events');
+    await client.query('LISTEN telemetry_compacted');
+    client.on('notification', onNotification);
 
-      if (signal?.aborted) {
+    const awaitWakeup = (remainingMs) => new Promise((resolve) => {
+      // A notification could have arrived while a snapshot was running.
+      if (pendingWake) return resolve('notified');
+      let settled = false;
+      const done = (reason) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
+        resolve(reason);
+      };
+      const onAbort = () => done('aborted');
+      const timer = setTimeout(() => done('timeout'), remainingMs);
+      signal?.addEventListener('abort', onAbort, { once: true });
+      wakeWaiter = () => done('notified');
+    });
+
+    const deadline = Date.now() + maxWait;
+    let { hwm, events } = await snapshot();
+
+    while (events.length === 0) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      const reason = await awaitWakeup(remaining);
+      if (reason === 'aborted' || signal?.aborted) {
         const e = new Error('client closed request');
         e.code = 'ABORTED';
         throw e;
       }
-      const again = await client.query('SELECT high_watermark FROM devices WHERE device_id=$1', [deviceId]);
-      hwm = Number(again.rows[0].high_watermark);
-      events = hwm > afterSequence ? await readBatch(afterSequence) : [];
+      // Re-snapshot under the device lock on every wakeup: a normal commit
+      // yields its new events, while a compaction committed while parked is
+      // visible here and produces 410. A notification whose commit lands after
+      // this snapshot either blocks on our FOR SHARE (so it cannot delete the
+      // events we just read) or remains pending and drives another snapshot.
+      pendingWake = false;
+      ({ hwm, events } = await snapshot());
     }
 
     return {
@@ -255,8 +322,10 @@ export async function waitForEvents(pool, cfg, { deviceId, afterSequence, limit,
       events,
     };
   } finally {
+    client.removeListener('notification', onNotification);
     try {
       await client.query('UNLISTEN telemetry_events');
+      await client.query('UNLISTEN telemetry_compacted');
     } catch {
       // connection may already be gone
     }
